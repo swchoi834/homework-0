@@ -1,0 +1,371 @@
+---
+title: "MovieLens Final Capstone Project"
+author: "Sung Wook Choi"
+date: "23/04/2020"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Introduction
+
+One of the most helpful applcations of machine learning in modern days is the recommendation system, where movies, videos and other media contents are recommended to the users based on their preferences, ratings...etc. Throughout this capstone project an attempt was made to build a model which successfully predicts ratings based off information such as movieids, userids genres, and the years the movies came out.
+
+
+Methods/Anaylsis
+
+Comments and descriptions are written to explain the procedures, techniques, analysis and other details. This project includes the following procedures/methods: edx/Validation Set Creation, Data Wrangling and Cleaning, Data Analysis and Exploration, Model Building and Final test on the validation set.
+
+1. edx/Validation Set creation
+```{r}
+################################
+# Create edx set, validation set
+################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+ # https://grouplens.org/datasets/movielens/10m/
+ # http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+ download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+ colnames(movies) <- c("movieId", "title", "genres")
+ movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                            title = as.character(title),
+                                            genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+ edx <- movielens[-test_index,]
+ temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+ edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+2. Data Wrangling/Data Cleaning 
+```{r}
+library(tidyverse)
+library(caret)
+library(data.table)
+if(!require(lubridate)) install.packages("lubridate", 
+                                         repos = "http://cran.us.r-project.org")
+library(lubridate)
+
+head(edx)
+nrow(edx)
+ncol(edx)
+names(edx)
+summary(edx) # Gives general statistical summary of the data
+```
+
+```{r}
+# We will omit any rows with na as inputs
+
+na.omit(edx)
+na.omit(validation)
+
+# Let's clean the data a little bit. We will change the column timestamp to dates using the lubridate package, to see the exact date when the movies were rated
+
+library(lubridate)
+edx <- edx %>% mutate(dates = as_datetime(timestamp)) %>% select(-timestamp)
+validation <- validation %>% mutate(date = as_datetime(timestamp)) %>% select(-timestamp)
+head(validation)
+
+# Create a new column, years
+edx  <- edx %>% mutate(years = as.numeric(str_sub(title,-5,-2))) 
+# extract years the movie came out and create a new column called years
+
+results <- tibble()
+#create a tibble which will organize all the RMSE's for different models
+```
+
+3. Data Analysis/Exploration
+```{r}
+if(!require(tidyverse)) install.packages("ggplot2", repos = "http://cran.us.r-project.org")
+library(ggplot2)
+
+# Let's take a closer look at the edx data and see if there is any bias within the data
+edx %>% 
+     dplyr::count(movieId) %>% 
+     ggplot(aes(n)) + 
+     geom_histogram(bins = 50, color = "red") + 
+     ggtitle("Movies")
+# We can see that some movies are rated more than others
+
+edx %>%
+     dplyr::count(userId) %>% 
+     ggplot(aes(n)) + 
+     geom_histogram(bins = 50, color = "blue") + 
+     ggtitle("Users")
+
+# Some users rate the movies more often than others
+# Let's also take a look at the frequency/distribution of the ratings
+
+ratings <- as.vector(edx$rating)
+ratings <- factor(ratings)
+qplot(ratings) +
+  ggtitle("Ratings Frequencies")
+
+# There is a high tendency that people often give out 3,4 as ratings
+```
+```{r}
+# We can also analyze the relationship between the variable time and other predictors
+# We can take a look at the relationship between years the movies were released and the mean ratings of each year
+
+edx %>% group_by(years) %>%
+   summarize(mean_rating = mean(rating)) %>%
+   ggplot(aes(years, mean_rating)) +
+   geom_smooth()
+
+# Used Loess method to smooth by default
+# We can see a generally see the that the average ratings for more recent movies are lower and movies that were in the mid-early 1900's have higher mean ratings
+```
+
+4. Model Building
+```{r}
+# Create a functon called 'RMSE'
+RMSE <- function(actual, predicted){
+  sqrt(mean((actual-predicted)^2))
+}
+
+# Clean the data for the validation set
+validation <- validation %>% mutate(years = as.numeric(str_sub(title,-5,-2)))
+
+# Splitting edx into test and training set
+set.seed(1996)
+test_index2 <- createDataPartition(edx$rating, times = 1, p = 0.1, list = FALSE)
+temporary_test <- edx %>% slice(test_index2)
+train <- edx %>% slice(-test_index2)
+
+# Making sure testset and train set have same movieIds and userIds
+test <- temporary_test %>% semi_join(train, by = "movieId") %>% 
+   semi_join(train, by = "userId")
+
+# Putting the removed rows back into the training set
+removed <- anti_join(temporary_test, test)
+train <- rbind(train, removed)
+
+test_ratings <- test$rating # ratings in test set
+```
+
+An extremely Simple model where ratings are pulled out randomly. We have a vector of ratings all the way from 0 to 5.0. These will be sampled randomly to predict the rating of a movie.
+
+```{r}
+set.seed(2020)
+random <- sample(c(0, 0.5, 1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0), length(test_ratings), replace = TRUE)
+RMSE(test_ratings,random)
+# RMSE turns out 2.156021 which is terrible considering that the prediction could differ by up to two stars!
+# Will test it on the validation set
+
+random <- sample(c(0, 0.5, 1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0), length(validation$rating), replace = TRUE)
+rmse_random <- RMSE(validation$rating, random)
+results <- bind_rows(results, data_frame(method="Random Model",  RMSE = rmse_random))
+```
+
+Simple model using just the yearly average of the entire ratings in the edx dataset. First we use a model that looks like the following (u, i subscripts for users and movies respectively):
+
+$$Y_{u,i} = \mu + \epsilon_{u,i}$$
+In this model we assume that they all have same ratings for all movies and users, where they differ just by random errors. Epsilon represents independent random errors.
+
+```{r}
+mu <- mean(train$rating)
+RMSE(test_ratings, mu)
+
+# RMSE has now decreased to 1.59691 which is much better, but more improvement could be made to this model
+# Let's test it on our validation set to obtain our RMSE
+
+mean_rmse <- RMSE(validation$rating, mu)
+results <- bind_rows(results, data_frame(method= "Mean Model",  RMSE = mean_rmse))
+```
+
+Instead of assuming the same ratings for all movies and users, We will incorporate the term b_i in the term which is the average rating for movie i (movie specific effect):
+
+$$Y_{u,i} = \mu + b_{i} + \epsilon_{u,i}$$
+
+```{r}
+permovie_averages1 <- train %>% group_by(movieId) %>% 
+   summarize(bi = mean(rating - mu))
+
+model1_prediction <- test %>% left_join(permovie_averages1, by='movieId') %>%
+   mutate(prediction = mu + bi)
+
+RMSE(test_ratings, model1_prediction$prediction) 
+# This was the RMSE for the test set, we will now obtain RMSE for the validation set
+
+model1_prediction_valid <- validation %>% left_join(permovie_averages1, by='movieId') %>%
+   mutate(prediction = mu + bi)
+model1_rmse <- RMSE(validation$rating, model1_prediction_valid$prediction)
+results <- bind_rows(results, data_frame(method= "Movie Specific Effect Model",  RMSE = model1_rmse))
+```
+
+We could make an improvement to our model by further incorporating the userId specific effects b_u.
+
+$$Y_{u,i} = \mu + b_{i} + b_{u} + \epsilon_{u,i}$$
+
+```{r}
+permovie_averages2 <- train %>% 
+   left_join(permovie_averages1, by='movieId') %>%
+   group_by(userId) %>%
+   summarize(bu = mean(rating - mu - bi))
+
+model2_prediction <- test %>% left_join(permovie_averages2, 'userId') %>% 
+   left_join(permovie_averages1, by='movieId') %>%
+   mutate(prediction = mu + bi + bu)
+
+RMSE(test_ratings, model2_prediction$prediction)
+# We did a better job at estimating the rating by incorporating the user specific effect to our model
+# Let's give it a try on our validation set
+
+model2_prediction_valid <- validation %>% left_join(permovie_averages1, by='movieId') %>%
+   left_join(permovie_averages2, by = 'userId') %>%
+   mutate(prediction = mu + bi + bu)
+   
+model2_rmse <- RMSE(validation$rating, model2_prediction_valid$prediction)
+results <- bind_rows(results, data_frame(method= "Movie + userId Specific Effect Model",  RMSE = model2_rmse))
+```
+
+We still could do better, we will incorporate the year effect b_y. Now our model looks like the following.
+$$Y_{u,i} = \mu + b_{i} + b_{u} + b_{y} + \epsilon_{u,i}$$
+```{r}
+permovie_averages5 <- train %>% 
+   left_join(permovie_averages1, by='movieId') %>%
+   left_join(permovie_averages2, by = 'userId') %>%
+   group_by(years) %>%
+   summarize(by = mean(rating - mu - bi - bu))
+
+model5_prediction <- test %>% left_join(permovie_averages2, 'userId') %>% 
+   left_join(permovie_averages1, 'movieId') %>%
+   left_join(permovie_averages5, 'years') %>%
+   mutate(prediction = mu + bi + bu + by)
+
+RMSE(test_ratings, model5_prediction$prediction)
+# By incorporating the year effect we were able to make an improvement on our model
+
+# Let's show that using our validation set
+model5_prediction_valid <- validation %>% left_join(permovie_averages1, by='movieId') %>%
+   left_join(permovie_averages2, by = 'userId') %>%
+   left_join(permovie_averages5, 'years') %>%
+   mutate(prediction = mu + bi + bu + by) 
+   
+model5_rmse <- RMSE(validation$rating, model5_prediction_valid$prediction)
+results <- bind_rows(results, data_frame(method= "Movie + userId + year Specific Effect Model",  RMSE = model5_rmse))
+```
+
+Regularization Based Approach:
+There were biases in our data; some movies were rated more often than others while some users rated movies more often than others. Furthermore, ratings on average were lower for more mordern movies. We will use the regularization based approach in order to minimize these effects on our results or bias. We will use cross-validation method to pick our best lambda which allows us to obtain. We will use regularization on movie, userId, and year specific effects.
+
+```{r}
+lambdas <- seq(0,7,0.25) 
+# Here the lambdas are tuning parameters and we will find the best lambda through cross validation method
+# For each lambda, bi & bu is calculated and ratings are predicted & tested against the testset
+# Cross validation code requires some time to run
+
+list_RMSE <- function(lambda){
+
+mu <- mean(train$rating)
+   
+permovie_averages3 <- train %>% 
+   group_by(movieId) %>% 
+   summarize(bi = sum(rating - mu)/(n() + lambda)) # movie specific effect regularized
+
+permovie_averages4 <- train %>% 
+   left_join(permovie_averages3, by='movieId') %>%
+   group_by(userId) %>%
+   summarize(bu = sum(rating - mu - bi)/(n() + lambda)) # userId specific effect regualarized
+   
+permovie_averages6 <- train %>% 
+      left_join(permovie_averages3, by='movieId') %>%
+      left_join(permovie_averages4, by ='userId') %>%
+      group_by(years) %>%
+      summarize(by = sum(rating - mu - bi - bu)/(n() + lambda)) # year specific effect regualarized
+# predict     
+test_prediction <- test %>% left_join(permovie_averages3, by = 'movieId') %>%
+      left_join(permovie_averages4, by ='userId') %>%
+      left_join(permovie_averages6, by ='years') %>%
+      mutate(prediction = mu + bi + bu + by)
+
+   RMSE(test_ratings, test_prediction$prediction)
+}
+```
+
+```{r}
+RMSEs <- sapply(lambdas, list_RMSE)
+plot(lambdas, RMSEs)
+
+lambdas[which.min(RMSEs)] 
+# Lambda which minimized RMSE the most (optimal RMSE) against the test data was 4.5
+# Now that we have our model lambda, we will test it out on our validation set
+```
+
+5. Final Test on Validation Set
+
+With our newly obtained lambda we will test our model on our validation set to obtain our final RMSE.
+
+```{r}
+mu <- mean(train$rating)
+   
+permovie_averages3 <- train %>% 
+   group_by(movieId) %>% 
+   summarize(bi = sum(rating - mu)/(n() + 4.5)) # movie specific effect regularized
+
+permovie_averages4 <- train %>% 
+   left_join(permovie_averages3, by='movieId') %>%
+   group_by(userId) %>%
+   summarize(bu = sum(rating - mu - bi)/(n() + 4.5)) # userId specific effect regualarized
+   
+permovie_averages6 <- train %>% 
+      left_join(permovie_averages3, by='movieId') %>%
+      left_join(permovie_averages4, by ='userId') %>%
+      group_by(years) %>%
+      summarize(by = sum(rating - mu - bi - bu)/(n() + 4.5)) # year specific effect regualarized
+      
+validation_prediction <- validation %>% left_join(permovie_averages3, by = 'movieId') %>%
+      left_join(permovie_averages4, by ='userId') %>%
+      left_join(permovie_averages6, by ='years') %>%
+      mutate(prediction = mu + bi + bu + by)
+```
+
+```{r}
+final <- RMSE(validation$rating, validation_prediction$prediction)
+results <- bind_rows(results, data_frame(method= "Regularization on Movie + userId Specific Effect Model",  RMSE = final))
+```
+
+Results/Model Performance
+
+There was a significant improvement of RMSE through addition of different effects to models. Our very first model which was just a random generation of ratings (certainly not what users want), had absurdly high RMSE of 2.156021. When we assumed that all the ratings were equal to the mean of the entire ratings, we obtained RMSE of 1.059691. Once we added movie specific and user specific effects to our mode our models certainly improved as the RMSE's decreased to 0.9430351 and 0.8651999 respectively (Up to this point we tested the models on our test set). Once we used our regularization method and cross validation method to select the optimal lambda of 4.5. Once we used regularization method on our final validation set, we obtained RMSE just extremely near 0.86490, which tells us that the model works very well and is trustworthy enough to predict ratings of the movies for the users. 
+
+```{r}
+results %>% knitr::kable() #final results
+```
+
+Conclusion
+
+Throughout this edx project, I had the opportunity to  have a great practice to brush up on skills such as data wrangling, exploration, critical thinking and build models that could predict outcomes. I have attempted to come up with an algorithm, given multiple features that predicts movie ratings. In conclusion model which we obtained from regularized effects on movie, user effect and years the movies were released were the most accurate by far, in terms of its ability to predict movie ratings. I don't see any limitations, as in factors that could have hindered my results. This project could have potentially a positive impact on the users of media platforms such as Netflix or Youtube, in a sense that this algorithm could allow the users to have more positive experience on the platform as more accurate recommendations could be made. 
